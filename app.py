@@ -1,0 +1,133 @@
+import streamlit as st
+import os
+import requests
+from PIL import Image
+from io import BytesIO
+from fpdf import FPDF
+import warnings
+from datetime import datetime
+
+warnings.filterwarnings('ignore')
+
+# --- 설정값 ---
+TARGET_HEIGHT_MM = 30
+PAGE_WIDTH_MM = 210
+MARGIN_MM = 10
+DPI = 300
+GAP_MM = 1
+
+# --- 네이버 API 키 (Streamlit Secrets) ---
+CLIENT_ID = st.secrets["NAVER_CLIENT_ID"]
+CLIENT_SECRET = st.secrets["NAVER_CLIENT_SECRET"]
+
+# --- 핵심 기능 ---
+def get_cover_from_naver(book_title):
+    try:
+        url = "https://openapi.naver.com/v1/search/book.json"
+        headers = {
+            "X-Naver-Client-Id": CLIENT_ID,
+            "X-Naver-Client-Secret": CLIENT_SECRET,
+        }
+        params = {"query": book_title, "display": 1}
+
+        res = requests.get(url, headers=headers, params=params, timeout=10)
+        res.raise_for_status()
+        items = res.json().get("items", [])
+
+        if not items:
+            return None
+
+        image_url = items[0].get("image")
+        if not image_url:
+            return None
+
+        img_res = requests.get(image_url, timeout=10)
+        if img_res.status_code != 200:
+            return None
+
+        img = Image.open(BytesIO(img_res.content))
+
+        # 세로 3cm에 맞게 리사이즈
+        target_height_px = int((TARGET_HEIGHT_MM / 25.4) * DPI)
+        width_ratio = target_height_px / img.height
+        target_width_px = int(img.width * width_ratio)
+
+        return img.resize((target_width_px, target_height_px), Image.Resampling.LANCZOS)
+
+    except Exception:
+        return None
+
+
+# --- 웹 화면(UI) 구성 ---
+st.set_page_config(page_title="책 표지 메이커", page_icon="📚")
+
+st.title("📚 책 표지 자동 수집기")
+st.markdown("책 제목을 입력하면 세로 **3cm**에 맞춰진 인쇄용 PDF를 만들어줍니다!")
+
+titles_input = st.text_area(
+    "책 제목을 한 줄에 하나씩 입력하세요:",
+    height=150,
+    placeholder="구름 사람들\n파친코\n불편한 편의점"
+)
+
+if st.button("🚀 PDF 만들기 시작!"):
+    titles = [t.strip() for t in titles_input.split('\n') if t.strip()]
+
+    if not titles:
+        st.warning("책 제목을 먼저 입력해주세요!")
+    else:
+        images = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        for i, t in enumerate(titles):
+            status_text.text(f"'{t}' 표지 찾는 중... ({i+1}/{len(titles)})")
+            img = get_cover_from_naver(t)
+            if img:
+                images.append(img)
+            else:
+                st.toast(f"'{t}' 표지 찾기 실패 ❌")
+            progress_bar.progress((i + 1) / len(titles))
+
+        status_text.text("PDF 생성 중...")
+
+        if images:
+            pdf = FPDF()
+            pdf.add_page()
+            x, y = MARGIN_MM, MARGIN_MM
+
+            for i, img in enumerate(images):
+                temp_path = f"temp_{i}.png"
+                img.save(temp_path)
+                w_mm = (img.width / DPI) * 25.4
+
+                if x + w_mm > PAGE_WIDTH_MM - MARGIN_MM:
+                    x = MARGIN_MM
+                    y += TARGET_HEIGHT_MM + GAP_MM
+                if y + TARGET_HEIGHT_MM > 280:
+                    pdf.add_page()
+                    y = MARGIN_MM
+                    x = MARGIN_MM
+
+                pdf.image(temp_path, x=x, y=y, h=TARGET_HEIGHT_MM)
+                x += w_mm + GAP_MM
+                os.remove(temp_path)
+
+            now = datetime.now()
+            filename = f"result_covers_{now.strftime('%Y%m%d_%H%M%S')}.pdf"
+            pdf.output(filename)
+
+            with open(filename, "rb") as f:
+                pdf_bytes = f.read()
+
+            os.remove(filename)
+
+            st.success("🎉 작업 완료! 아래 버튼을 눌러 저장하세요.")
+            st.download_button(
+                label="📥 완성된 PDF 다운로드",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf"
+            )
+        else:
+            st.error("저장할 표지가 없습니다. 제목을 확인해주세요.")

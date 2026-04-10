@@ -87,6 +87,20 @@ def get_cover_from_naver(book_title, publisher, target_height_mm):
     except Exception:
         return None, ""
 
+def find_korean_font():
+    """Windows/Linux 환경에서 한글 폰트 경로를 찾아 반환."""
+    candidates = [
+        "C:/Windows/Fonts/malgun.ttf",                                          # Windows
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",                      # Linux (Nanum)
+        "/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",               # Linux (Noto)
+        "/usr/share/fonts/noto-cjk/NotoSansCJKkr-Regular.otf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
 # --- PDF 저장 ---
 def save_pdf(results, target_height_mm, filename_base):
     FONT_SIZE_PT = 6
@@ -95,11 +109,16 @@ def save_pdf(results, target_height_mm, filename_base):
     pdf = FPDF()
     pdf.add_page()
 
-    # 한글 폰트 로드 시도
-    try:
-        pdf.add_font("Korean", fname="C:/Windows/Fonts/malgun.ttf")
-        pdf.set_font("Korean", size=FONT_SIZE_PT)
-    except Exception:
+    font_path = find_korean_font()
+    has_korean_font = False
+    if font_path:
+        try:
+            pdf.add_font("Korean", fname=font_path)
+            pdf.set_font("Korean", size=FONT_SIZE_PT)
+            has_korean_font = True
+        except Exception:
+            pass
+    if not has_korean_font:
         pdf.set_font("Helvetica", size=FONT_SIZE_PT)
 
     x, y = MARGIN_MM, MARGIN_MM
@@ -120,7 +139,7 @@ def save_pdf(results, target_height_mm, filename_base):
 
         pdf.image(temp_path, x=x, y=y, h=target_height_mm)
 
-        if publisher:
+        if publisher and has_korean_font:
             pdf.set_xy(x, y + target_height_mm + 0.5)
             pdf.cell(w_mm, TEXT_HEIGHT_MM - 0.5, txt=publisher)
 

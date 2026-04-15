@@ -2,3 +2,4 @@ streamlit
 requests
 Pillow
 fpdf2
+gdown

@@ -6,6 +6,9 @@ import warnings
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
+import json
+from urllib.parse import unquote
+
 import requests
 from PIL import Image
 from fpdf import FPDF
@@ -19,7 +22,7 @@ st.set_page_config(page_title="책 표지 메이커", page_icon="📚")
 PAGE_W_MM = 210
 MARGIN_MM = 10
 DPI       = 300
-GAP_MM    = 1
+GAP_DEFAULT_MM = 0        # 표지 사이 간격 기본값 (사용자가 조절)
 
 SERIES = {
     "민음사 세계문학전집":    {"id": "1A3Zik6ak8djGmVLYHL-2ct5pF0dshyfW", "folder": "minumsa"},
@@ -34,7 +37,23 @@ _KST         = timezone(timedelta(hours=9))
 _PASSWD_START = datetime(2026, 4, 15, 10, 0, 0, tzinfo=_KST)   # 최초 비밀번호 적용 시각
 
 def _load_password_list():
-    """비밀번호목록.txt 에서 한 줄에 하나씩 읽어 반환."""
+    """비밀번호 목록을 읽는다.
+
+    비밀번호는 저장소에 올리지 않는다. 배포 환경에서는 Streamlit secrets의
+    PASSWORD_LIST(줄바꿈으로 구분)를 쓰고, 로컬 개발에서는 비밀번호목록.txt를 쓴다.
+    """
+    raw = None
+    try:
+        raw = st.secrets["PASSWORD_LIST"]
+    except Exception:
+        raw = None
+    if not raw:
+        raw = os.environ.get("PASSWORD_LIST")
+
+    if raw:
+        lines = raw.splitlines() if isinstance(raw, str) else list(raw)
+        return [pw.strip() for pw in lines if pw and pw.strip()]
+
     passwords = []
     try:
         with open("비밀번호목록.txt", "r", encoding="utf-8") as f:
@@ -137,7 +156,9 @@ def find_korean_font():
         if os.path.exists(p): return p
     return None
 
-def build_pdf(results, target_height_mm: float) -> bytes:
+def build_pdf(results, target_height_mm: float,
+              gap_x_mm: float = GAP_DEFAULT_MM,
+              gap_y_mm: float = GAP_DEFAULT_MM) -> bytes:
     FONT_PT = 6; TEXT_H_MM = 4
     pdf = FPDF(); pdf.add_page()
     fp = find_korean_font(); has_font = False
@@ -149,8 +170,10 @@ def build_pdf(results, target_height_mm: float) -> bytes:
     if not has_font:
         pdf.set_font("Helvetica", size=FONT_PT)
 
+    # 한글 폰트가 없으면 제목을 못 찍으므로 제목용 여백도 잡지 않는다
+    text_h = TEXT_H_MM if has_font else 0
     x, y   = MARGIN_MM, MARGIN_MM
-    row_h  = target_height_mm + TEXT_H_MM + GAP_MM
+    row_h  = target_height_mm + text_h + gap_y_mm
 
     for i, (img, title, _) in enumerate(results):
         tmp = f"/tmp/_cover_{i}.png"; img.save(tmp)
@@ -162,8 +185,8 @@ def build_pdf(results, target_height_mm: float) -> bytes:
         pdf.image(tmp, x=x, y=y, h=target_height_mm)
         if has_font:
             pdf.set_xy(x, y + target_height_mm + 0.5)
-            pdf.cell(w_mm, TEXT_H_MM - 0.5, txt=title[:30])
-        x += w_mm + GAP_MM
+            pdf.cell(w_mm, text_h - 0.5, txt=title[:30])
+        x += w_mm + gap_x_mm
         os.remove(tmp)
 
     out_path = "/tmp/_result.pdf"; pdf.output(out_path)
@@ -180,31 +203,164 @@ def build_zip(results) -> bytes:
             zf.writestr(f"{i+1:03d}_{safe}.png", b.getvalue())
     return buf.getvalue()
 
-# ── 네이버 API (검색하여 받기) ────────────────────────────────────────
-def get_cover_from_naver(book_title, publisher, target_height_mm):
+# ── 표지 검색 (검색하여 받기) ─────────────────────────────────────────
+# 네이버 '책' 검색 API는 2026-07-31 종료(SE05). 대체로 네이버 '이미지' 검색을
+# 써봤지만 도서 DB가 아니라 키워드 매칭이라 뒤표지·내지·다른 책이 섞이고,
+# 정작 찾아야 할 책을 못 찾는 경우가 많아 알라딘 TTB API로 전환했다.
+# 알라딘은 제목·출판사·저자가 함께 오므로 정확히 지정할 수 있다.
+
+_ALADIN_ENDPOINT = "https://www.aladin.co.kr/ttb/api/ItemSearch.aspx"
+_ALADIN_DAILY_LIMIT = 5000        # 알라딘 OpenAPI 일일 호출 한도
+# 표지가 아니거나 다른 상품인 결과를 걸러내는 단어
+_REJECT_WORDS  = ("세트", "중고", "사은품", "굿즈", "전자책", "오디오북",
+                  "블루레이", "DVD", "OST")
+_EDITION_WORDS = ("에디션", "특별판", "한정", "워터프루프", "포토", "리커버")
+_FOREIGN_WORDS = ("중문판", "영문판", "일문판", "중국어", "영어판", "번체", "간체")
+_HTTP_HEADERS  = {"User-Agent": "Mozilla/5.0"}
+
+QUOTA_MESSAGE = ("오늘 사용할 수 있는 검색 횟수를 모두 썼습니다. "
+                 f"(알라딘 OpenAPI 일일 {_ALADIN_DAILY_LIMIT:,}회) 내일 다시 이용해주세요.")
+
+
+class QuotaExceeded(Exception):
+    """알라딘 일일 호출 한도 초과."""
+
+
+def _get_secret(name: str):
+    """st.secrets → 환경변수 순으로 조회. 없으면 None."""
     try:
-        headers = {
-            "X-Naver-Client-Id":     st.secrets["NAVER_CLIENT_ID"],
-            "X-Naver-Client-Secret": st.secrets["NAVER_CLIENT_SECRET"],
-        }
-        query  = f"{book_title} {publisher}".strip() if publisher else book_title
-        res    = requests.get("https://openapi.naver.com/v1/search/book.json",
-                              headers=headers, params={"query": query, "display": 1}, timeout=10)
-        res.raise_for_status()
-        items  = res.json().get("items", [])
-        if not items: return None, ""
-        item   = items[0]
-        img_url = item.get("image", "")
-        api_pub = item.get("publisher", "")
-        if not img_url: return None, api_pub
-        ir = requests.get(img_url, timeout=10)
-        if ir.status_code != 200: return None, api_pub
-        img = Image.open(BytesIO(ir.content))
-        th  = int((target_height_mm / 25.4) * DPI)
-        tw  = int(img.width * th / img.height)
-        return img.resize((tw, th), Image.Resampling.LANCZOS), api_pub
+        v = st.secrets[name]
+        if v:
+            return v
     except Exception:
-        return None, ""
+        pass
+    return os.environ.get(name) or None
+
+
+def _norm(s: str) -> str:
+    return re.sub(r'[^0-9a-z가-힣]', '', (s or "").lower())
+
+
+def _product_name(title: str) -> str:
+    """'소년이 온다 (10주년 특별판)' → '소년이 온다'"""
+    t = re.sub(r'^\s*\[[^\]]*\]\s*', '', title or "")   # 앞머리 [POD] 등 제거
+    t = re.split(r'\s-\s', t)[0]                         # 부제 분리
+    return re.sub(r'\([^)]*\)', '', t).strip()
+
+
+def _aladin_hi_res(url: str) -> str:
+    """알라딘 표지 URL을 500px 판본으로 (coversum/cover200 → cover500)."""
+    return re.sub(r'/cover(?:sum|big|\d+)?/', '/cover500/', url or "", count=1)
+
+
+def _aladin_request(query: str, key: str, attempts: int = 3):
+    params = {"ttbkey": key, "Query": query, "QueryType": "Title",
+              "MaxResults": 50, "start": 1, "SearchTarget": "Book",
+              "output": "js", "Version": "20131101", "Cover": "Big"}
+    # 알라딘 응답이 가끔 느려 한 번의 타임아웃으로 책을 통째로 놓치지 않도록 재시도
+    for attempt in range(attempts):
+        try:
+            r = requests.get(_ALADIN_ENDPOINT, params=params, timeout=15)
+            r.raise_for_status()
+            break
+        except requests.RequestException:
+            if attempt == attempts - 1:
+                raise
+    data = json.loads(r.text.strip().rstrip(';'))
+    msg = data.get("errorMessage")
+    if msg:
+        # 한도 초과는 사용자에게 다르게 안내해야 하므로 따로 구분한다
+        if any(w in msg for w in ("한도", "초과", "제한", "Limit", "limit", "Over")):
+            raise QuotaExceeded(msg)
+        raise RuntimeError(f"알라딘 API: {msg}")
+    return data.get("item", [])
+
+
+def _build_candidate(it, publisher, nb, exact):
+    cover = _aladin_hi_res(it.get("cover", ""))
+    if not cover:
+        return None
+    title = it.get("title", "")
+    if any(bad in title for bad in _REJECT_WORDS):
+        return None
+    pub, author = it.get("publisher", ""), it.get("author", "")
+    if exact:
+        score = 100
+        if publisher and _norm(publisher) in _norm(pub):
+            score += 40                                # 지정한 출판사면 크게 우대
+        if any(e in title for e in _EDITION_WORDS):
+            score -= 20
+        if any(f in title for f in _FOREIGN_WORDS):
+            score -= 30
+        if _norm(_product_name(title)) == nb:
+            score += 15
+        label = " · ".join(x for x in (pub, author[:22]) if x)
+    else:
+        score = 0
+        label = "유사 · " + " · ".join(x for x in (pub, title[:26]) if x)
+    return {"url": cover, "score": score, "source": "알라딘", "label": label}
+
+
+def get_cover_candidates(book_title, publisher="", limit=6):
+    """([{url, label, source}], 실패 사유 | None)
+
+    알라딘 TTB API로 조회한다. 제목이 정확히 맞는 결과를 우선 쓰고, 하나도 없으면
+    검색어를 뒤에서부터 줄여가며 다시 찾아 '유사' 후보로 보여준다(오타·부제 차이 대응).
+    """
+    key = _get_secret("ALADIN_TTB_KEY")
+    if not key:
+        return [], ("알라딘 API 키가 없습니다. Streamlit secrets에 "
+                    "ALADIN_TTB_KEY를 설정하세요.")
+
+    nb    = _norm(book_title)
+    full  = f"{book_title} {publisher}".strip() if publisher else book_title
+    words = book_title.split()
+    # 전체 검색어 → 제목만 → 뒤 단어를 하나씩 떼며 재시도
+    queries = [full, book_title] + [" ".join(words[:i]) for i in range(len(words) - 1, 0, -1)]
+
+    seen_q, similar = set(), []
+    for qi, query in enumerate(queries):
+        if not query or query in seen_q:
+            continue
+        seen_q.add(query)
+        try:
+            items = _aladin_request(query, key)
+        except QuotaExceeded:
+            return [], QUOTA_MESSAGE
+        except Exception as e:
+            return [], str(e)
+
+        # 정확히 일치하는 것과 유사한 것을 나눈다
+        exact, loose = [], []
+        for it in items:
+            is_exact = _norm(_product_name(it.get("title", ""))).startswith(nb)
+            cand = _build_candidate(it, publisher, nb, is_exact)
+            if not cand:
+                continue
+            (exact if is_exact else loose).append(cand)
+
+        if exact:
+            exact.sort(key=lambda c: -c["score"])
+            return exact[:limit], None
+        if loose and not similar:
+            similar = loose            # 더 짧은 검색어의 결과보다 먼저 찾은 쪽을 남긴다
+
+    if similar:
+        return similar[:limit], None
+    return [], "알라딘에서 해당 도서를 찾지 못했습니다. 제목을 확인해주세요."
+
+
+def download_cover(url):
+    ir = requests.get(url, timeout=10, headers=_HTTP_HEADERS)
+    ir.raise_for_status()
+    return Image.open(BytesIO(ir.content)).convert("RGB")
+
+
+def resize_to_height(img, target_height_mm: float):
+    th = int((target_height_mm / 25.4) * DPI)
+    tw = max(1, int(img.width * th / img.height))
+    return img.resize((tw, th), Image.Resampling.LANCZOS)
+
 
 # ══════════════════════════════════════════════════════════════════════
 # 페이지 함수
@@ -318,6 +474,8 @@ def show_bulk():
     with col_b:
         fmt = st.radio("저장 형식", ["PDF", "PNG"], horizontal=True, key="bulk_fmt")
 
+    gap_x, gap_y = layout_gap_controls("bulk")
+
     if st.button("🚀  만들기 시작", key="bulk_gen"):
         # 1. Google Drive에서 다운로드 (캐시됨)
         with st.spinner(f"'{selected}' 이미지 준비 중… (첫 실행 시 다운로드 포함)"):
@@ -341,7 +499,7 @@ def show_bulk():
 
         with st.spinner("파일 생성 중…"):
             if fmt == "PDF":
-                data = build_pdf(results, height_cm * 10)
+                data = build_pdf(results, height_cm * 10, gap_x, gap_y)
                 st.success(f"완료! {len(results)}권 → PDF")
                 st.download_button("📥  PDF 다운로드", data=data,
                                    file_name=f"{base}_{ts}.pdf", mime="application/pdf")
@@ -352,18 +510,120 @@ def show_bulk():
                                    file_name=f"{base}_{ts}.zip", mime="application/zip")
 
 
+def layout_gap_controls(key_prefix: str):
+    """표지 사이 간격(좌우·상하) 슬라이더. 기본값 0mm = 표지끼리 딱 붙음."""
+    st.markdown("<p style='font-size:0.82rem; color:#9A9690; margin:0.6rem 0 0.2rem 0;'>"
+                "표지 사이 간격 (0 = 붙여서 배치)</p>", unsafe_allow_html=True)
+    g1, g2 = st.columns(2)
+    with g1:
+        gap_x = st.slider("좌우 간격", min_value=0.0, max_value=20.0, value=0.0,
+                          step=0.5, format="%.1f mm", key=f"{key_prefix}_gap_x")
+    with g2:
+        gap_y = st.slider("상하 간격", min_value=0.0, max_value=20.0, value=0.0,
+                          step=0.5, format="%.1f mm", key=f"{key_prefix}_gap_y")
+    return gap_x, gap_y
+
+
 def show_search():
     inject_css()
     if st.button("← 뒤로", key="search_back"):
         st.session_state["page"] = "main"
+        for k in ("sr_books", "sr_quota"):
+            st.session_state.pop(k, None)
         st.rerun()
 
     st.markdown("""
     <div style="padding:0.5rem 0 2rem 0;">
         <h2 style="font-size:1.6rem; color:#2C4F7C; margin:0 0 0.4rem 0; font-weight:700;">🔍 검색하여 받기</h2>
-        <p style="color:#8A8278; font-size:0.95rem; margin:0;">책 제목을 입력하면 인쇄용 파일을 자동으로 만들어드립니다</p>
+        <p style="color:#8A8278; font-size:0.95rem; margin:0;">책마다 표지 후보를 보여드립니다. 원하는 판본을 고르세요.</p>
     </div>""", unsafe_allow_html=True)
 
+    st.markdown("<p style='font-weight:500; color:#4A4A4A; margin-bottom:0.3rem;'>책 목록</p>",
+                unsafe_allow_html=True)
+    st.markdown("<p style='font-size:0.82rem; color:#9A9690; margin-bottom:0.5rem;'>"
+                "한 줄에 한 권씩 &nbsp;·&nbsp; 출판사를 쉼표로 덧붙이면 원하는 판본이 위로 옵니다 "
+                "<code>데미안, 민음사</code></p>", unsafe_allow_html=True)
+
+    titles_input = st.text_area("책 목록", height=180,
+                                placeholder="구름 사람들\n파친코, 문학사상\n데미안, 민음사",
+                                label_visibility="collapsed")
+
+    if st.button("🔍  표지 찾기", key="search_run"):
+        entries = []
+        for line in [l.strip() for l in titles_input.split('\n') if l.strip()]:
+            if ',' in line:
+                t, pub = line.split(',', 1)
+                entries.append((t.strip(), pub.strip()))
+            else:
+                entries.append((line, ""))
+        if not entries:
+            st.warning("책 제목을 먼저 입력해주세요.")
+            return
+
+        books = []
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+        for i, (title, pub) in enumerate(entries):
+            status_text.markdown(
+                f"<p style='color:#8A8278; font-size:0.9rem;'>"
+                f"'{title}' 표지 찾는 중… ({i+1}/{len(entries)})</p>", unsafe_allow_html=True)
+            cands, err = get_cover_candidates(title, pub)
+            books.append({"title": title, "pub": pub, "candidates": cands, "error": err})
+            progress_bar.progress((i + 1) / len(entries))
+            if err == QUOTA_MESSAGE:
+                break                  # 한도를 넘겼으면 나머지도 실패하므로 즉시 중단
+        status_text.empty(); progress_bar.empty()
+        st.session_state["sr_books"]  = books
+        st.session_state["sr_quota"]  = any(b["error"] == QUOTA_MESSAGE for b in books)
+        st.rerun()
+
+    books = st.session_state.get("sr_books")
+    if books is None:
+        return
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+
+    if st.session_state.get("sr_quota"):
+        st.error(f"⏳ {QUOTA_MESSAGE}")
+
+    missing = [b for b in books if not b["candidates"]]
+    if missing:
+        with st.expander(f"⚠️ 표지를 찾지 못한 책 {len(missing)}권 — 원인 보기"):
+            for b in missing:
+                st.write(f"• {b['title']} — {b['error']}")
+
+    usable = [b for b in books if b["candidates"]]
+    if not usable:
+        st.error("표지를 하나도 찾지 못했습니다. 제목·출판사를 확인해주세요.")
+        return
+
+    st.markdown("<p style='font-weight:600; color:#2C4F7C; margin-bottom:0.2rem;'>"
+                "표지 고르기</p>", unsafe_allow_html=True)
+    st.markdown("<p style='font-size:0.82rem; color:#9A9690; margin-bottom:1rem;'>"
+                "같은 책도 리커버·개정판 등 판본이 여러 개일 수 있습니다. "
+                "원하는 것을 고르고, 쓰지 않을 책은 <b>제외</b>를 선택하세요.</p>",
+                unsafe_allow_html=True)
+
+    for bi, book in enumerate(usable):
+        label = book["title"] + (f" ({book['pub']})" if book["pub"] else "")
+        st.markdown(f"<p style='font-weight:600; color:#4A4A4A; margin:1.2rem 0 0.4rem 0;'>"
+                    f"{label}</p>", unsafe_allow_html=True)
+
+        cands = book["candidates"]
+        cols  = st.columns(max(len(cands), 3))
+        for ci, cand in enumerate(cands):
+            with cols[ci]:
+                # 서점 이미지는 핫링크가 열려 있어 URL로 바로 미리보기 (서버 부담 없음)
+                st.image(cand["url"], width='stretch')
+                st.markdown(f"<p style='font-size:0.72rem; color:#9A9690; margin:-0.3rem 0 0 0;'>"
+                            f"{ci+1}. {cand['source']}<br>{cand['label']}</p>",
+                            unsafe_allow_html=True)
+
+        st.radio("선택", options=list(range(len(cands))) + [-1],
+                 format_func=lambda i: "제외" if i == -1 else f"{i+1}번",
+                 horizontal=True, key=f"pick_{bi}", label_visibility="collapsed")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
     col1, col2 = st.columns([3, 2])
     with col1:
         height_cm = st.slider("표지 높이 (최대 5cm)", min_value=1.0, max_value=5.0,
@@ -371,65 +631,44 @@ def show_search():
     with col2:
         fmt = st.radio("저장 형식", ["PDF", "PNG"], horizontal=True, key="search_fmt")
 
-    st.markdown("<hr>", unsafe_allow_html=True)
-    st.markdown("<p style='font-weight:500; color:#4A4A4A; margin-bottom:0.3rem;'>책 목록</p>",
-                unsafe_allow_html=True)
-    st.markdown("<p style='font-size:0.82rem; color:#9A9690; margin-bottom:0.5rem;'>"
-                "한 줄에 한 권씩 &nbsp;·&nbsp; 출판사는 쉼표로 구분 "
-                "<code>파친코, 문학사상</code></p>", unsafe_allow_html=True)
+    gap_x, gap_y = layout_gap_controls("search")
 
-    titles_input = st.text_area("책 목록", height=180,
-                                placeholder="구름 사람들\n파친코, 문학사상\n불편한 편의점",
-                                label_visibility="collapsed")
-
-    if st.button("🚀  만들기 시작", key="search_gen"):
-        lines = [l.strip() for l in titles_input.split('\n') if l.strip()]
-        entries = []
-        for line in lines:
-            if ',' in line:
-                p = line.split(',', 1)
-                entries.append((p[0].strip(), p[1].strip()))
-            else:
-                entries.append((line.strip(), ""))
-
-        if not entries:
-            st.warning("책 제목을 먼저 입력해주세요.")
+    if st.button("🚀  선택한 표지로 만들기", key="search_gen"):
+        picked = []
+        for bi, book in enumerate(usable):
+            idx = st.session_state.get(f"pick_{bi}", 0)
+            if idx != -1:
+                picked.append((book, book["candidates"][idx]))
+        if not picked:
+            st.warning("표지를 하나 이상 선택해주세요.")
             return
 
-        results      = []
-        progress_bar = st.progress(0)
-        status_text  = st.empty()
-
-        for i, (title, pub) in enumerate(entries):
-            status_text.markdown(
-                f"<p style='color:#8A8278; font-size:0.9rem;'>"
-                f"'{title}' 표지 찾는 중… ({i+1}/{len(entries)})</p>",
-                unsafe_allow_html=True)
-            img, api_pub = get_cover_from_naver(title, pub, height_cm * 10)
-            if img:
-                results.append((img, title, pub if pub else api_pub))
-            else:
-                st.toast(f"'{title}' 표지를 찾지 못했습니다.")
-            progress_bar.progress((i + 1) / len(entries))
-
-        status_text.markdown("<p style='color:#8A8278; font-size:0.9rem;'>파일 생성 중…</p>",
-                             unsafe_allow_html=True)
+        results, failed = [], []
+        with st.spinner("선택한 표지 내려받는 중…"):
+            for book, cand in picked:
+                try:
+                    img = download_cover(cand["url"])
+                    results.append((resize_to_height(img, height_cm * 10),
+                                    book["title"], book["pub"]))
+                except Exception as e:
+                    failed.append(f"{book['title']} — 내려받기 실패: {e}")
+        if failed:
+            for f in failed:
+                st.warning(f)
         if not results:
-            st.error("저장할 표지가 없습니다. 제목을 확인해주세요.")
+            st.error("표지를 내려받지 못했습니다.")
             return
 
-        ts   = datetime.now().strftime('%Y%m%d_%H%M%S')
-        status_text.empty()
-
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         with st.spinner("파일 생성 중…"):
             if fmt == "PDF":
-                data = build_pdf(results, height_cm * 10)
-                st.success("작업 완료! 아래 버튼을 눌러 저장하세요.")
+                data = build_pdf(results, height_cm * 10, gap_x, gap_y)
+                st.success(f"완료! {len(results)}권 → PDF")
                 st.download_button("📥  PDF 다운로드", data=data,
                                    file_name=f"covers_{ts}.pdf", mime="application/pdf")
             else:
                 data = build_zip(results)
-                st.success("작업 완료! 아래 버튼을 눌러 저장하세요.")
+                st.success(f"완료! {len(results)}권 → PNG ZIP")
                 st.download_button("📥  PNG ZIP 다운로드", data=data,
                                    file_name=f"covers_{ts}.zip", mime="application/zip")
 
